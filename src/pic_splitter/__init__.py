@@ -3,12 +3,51 @@ import sys
 import warnings
 
 import numpy as np
-from skimage import color, io, segmentation, measure, morphology, filters
-from scipy import ndimage as ndi
+from skimage import color, io, segmentation, filters, measure, morphology
 from sklearn.cluster import KMeans
 
 # Suppress low contrast warnings
 warnings.filterwarnings("ignore", message=".*is a low contrast image")
+
+
+def felzenszwalb_segmentation(image: np.ndarray, scale: float = 100, min_size: int = 200) -> np.ndarray:
+    """
+    Apply Felzenszwalb segmentation algorithm.
+    
+    Args:
+        image: RGB image
+        scale: Higher scale means larger segments
+        min_size: Minimum component size
+        
+    Returns:
+        Segmentation labels
+    """
+    return segmentation.felzenszwalb(
+        image, 
+        scale=scale,
+        sigma=0.5,
+        min_size=min_size
+    )
+
+
+def slic_segmentation(image: np.ndarray, n_segments: int = 30) -> np.ndarray:
+    """
+    Apply SLIC segmentation to get superpixels.
+    
+    Args:
+        image: RGB image
+        n_segments: Target number of segments
+        
+    Returns:
+        Segmentation labels
+    """
+    return segmentation.slic(
+        image,
+        n_segments=n_segments,
+        compactness=10,
+        sigma=1,
+        start_label=1
+    )
 
 
 def color_quantize(image: np.ndarray, n_colors: int = 8) -> np.ndarray:
@@ -23,11 +62,11 @@ def color_quantize(image: np.ndarray, n_colors: int = 8) -> np.ndarray:
         Quantized RGB image
     """
     # Reshape the image
-    w, h, d = image.shape
-    pixels = image.reshape((w * h, d))
+    h, w, d = image.shape
+    pixels = image.reshape((-1, d))
     
     # Convert to LAB for better color perception
-    pixels_lab = color.rgb2lab(pixels.reshape((-1, 1, 3))).reshape((-1, 3))
+    pixels_lab = color.rgb2lab(pixels)
     
     # Apply K-means clustering to find dominant colors
     kmeans = KMeans(n_clusters=n_colors, random_state=42, n_init="auto")
@@ -42,12 +81,12 @@ def color_quantize(image: np.ndarray, n_colors: int = 8) -> np.ndarray:
     for i in range(n_colors):
         quantized[labels == i] = centers_rgb[i]
     
-    return quantized.reshape((w, h, d))
+    return quantized.reshape((h, w, d))
 
 
 def texture_aware_segmentation(image: np.ndarray, n_colors: int = 8, texture_threshold: float = 0.2) -> np.ndarray:
     """
-    Perform texture-aware segmentation that respects both color and texture patterns.
+    Perform texture-aware segmentation using multiple algorithms.
     
     Args:
         image: RGB image
@@ -57,148 +96,82 @@ def texture_aware_segmentation(image: np.ndarray, n_colors: int = 8, texture_thr
     Returns:
         Segmentation labels
     """
-    # Step 1: Quantize colors
-    print("Step 1: Quantizing colors...")
+    print("Applying multiple segmentation methods...")
+    
+    results = {}
+    
+    # Method 1: Simple Felzenszwalb segmentation
+    for scale in [100, 200, 400]:
+        labels = felzenszwalb_segmentation(image, scale=scale, min_size=50)
+        num_segments = len(np.unique(labels))
+        name = f"Felzenszwalb (scale={scale})"
+        results[name] = (labels, num_segments)
+        print(f"  - {name}: {num_segments} segments")
+    
+    # Method 2: SLIC segmentation with different segment counts
+    for count in [15, 30, 60]:
+        labels = slic_segmentation(image, n_segments=count)
+        num_segments = len(np.unique(labels))
+        name = f"SLIC (n={count})"
+        results[name] = (labels, num_segments)
+        print(f"  - {name}: {num_segments} segments")
+    
+    # Method 3: Color-based segmentation with k-means
+    # Quantize colors first
     quantized = color_quantize(image, n_colors=n_colors)
     
-    # Step 2: Initial segmentation based on color regions
-    print("Step 2: Creating initial segments based on color...")
-    # Convert to LAB for better color discrimination
+    # Convert to LAB
     lab_image = color.rgb2lab(quantized)
     
-    # Create an initial segmentation based on color
-    initial_segments = np.zeros((lab_image.shape[0], lab_image.shape[1]), dtype=np.int32)
+    # Create a mask for each color cluster
+    h, w, _ = lab_image.shape
+    color_mask = np.zeros((h, w), dtype=np.int32)
     
-    # We'll use a region growing approach where regions with similar colors are grouped
-    # First convert the LAB image to a set of unique color indices
-    reshaped_lab = lab_image.reshape((-1, 3))
-    unique_colors = np.unique(reshaped_lab, axis=0)
-    color_to_index = {tuple(color): i+1 for i, color in enumerate(unique_colors)}
+    # Reshape and cluster again to get discrete regions
+    pixels_lab = lab_image.reshape((-1, 3))
+    kmeans = KMeans(n_clusters=min(15, n_colors*2), random_state=42, n_init="auto")
+    color_labels = kmeans.fit_predict(pixels_lab)
+    color_mask = color_labels.reshape((h, w))
     
-    # Assign each pixel to its color index
-    for i in range(lab_image.shape[0]):
-        for j in range(lab_image.shape[1]):
-            pixel_color = tuple(lab_image[i, j])
-            # Find the closest color in our unique colors (within a small threshold)
-            min_dist = float('inf')
-            closest_idx = None
-            for color_idx, color in enumerate(unique_colors):
-                dist = np.linalg.norm(np.array(pixel_color) - color)
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_idx = color_idx + 1
-            initial_segments[i, j] = closest_idx
+    # Apply connected components to get contiguous regions
+    labels = measure.label(color_mask, connectivity=2)
+    num_segments = len(np.unique(labels))
+    name = f"Color-based (n_colors={n_colors})"
+    results[name] = (labels, num_segments)
+    print(f"  - {name}: {num_segments} segments")
     
-    # Step 3: Apply connected components to get contiguous regions
-    print("Step 3: Finding connected regions...")
-    labels = measure.label(initial_segments, connectivity=2)
+    # Find best method with target number of segments (10-40)
+    best_method = None
+    best_count = 0
+    target_segments = 25  # Aim for this many segments
     
-    # Step 4: Analyze texture within each region
-    print("Step 4: Analyzing texture patterns...")
-    gray = color.rgb2gray(image)
+    for name, (labels, count) in results.items():
+        if 10 <= count <= 40:
+            if not best_method or abs(count - target_segments) < abs(best_count - target_segments):
+                best_method = name
+                best_count = count
     
-    # Apply Gabor filters for texture analysis
-    texture_features = []
-    for theta in [0, np.pi/4, np.pi/2, 3*np.pi/4]:
-        # Real part of Gabor filter response
-        real_gabor = filters.gabor(gray, frequency=0.6, theta=theta)[0]
-        texture_features.append(real_gabor)
+    # If no method with 10-40 segments, find closest to target
+    if not best_method:
+        for name, (labels, count) in results.items():
+            if not best_method or abs(count - target_segments) < abs(best_count - target_segments):
+                best_method = name
+                best_count = count
     
-    # Stack features
-    texture_stack = np.stack(texture_features, axis=-1)
+    print(f"\nSelected: {best_method} with {best_count} segments")
     
-    # Step 5: Merge regions with similar texture and color
-    print("Step 5: Merging regions with similar texture...")
+    # Use the selected segmentation method
+    final_labels = results[best_method][0]
     
-    # We'll create a region adjacency graph
-    regions = measure.regionprops(labels)
-    n_regions = len(regions)
+    # Clean up small regions
+    min_region_size = 50
+    cleaned_labels = morphology.remove_small_objects(final_labels, min_size=min_region_size)
+    cleaned_labels = measure.label(cleaned_labels)
     
-    # For each region, compute average color and texture
-    region_stats = {}
-    for region in regions:
-        label = region.label
-        mask = labels == label
-        
-        # Skip tiny regions
-        if np.sum(mask) < 50:
-            continue
-            
-        # Compute mean color in LAB space
-        mean_color = np.mean(lab_image[mask], axis=0)
-        
-        # Compute texture statistics (mean and variance of filter responses)
-        texture_means = []
-        texture_vars = []
-        for i in range(texture_stack.shape[-1]):
-            texture_means.append(np.mean(texture_stack[mask, i]))
-            texture_vars.append(np.var(texture_stack[mask, i]))
-        
-        texture_features = np.array(texture_means + texture_vars)
-        
-        region_stats[label] = {
-            'color': mean_color,
-            'texture': texture_features,
-            'size': np.sum(mask),
-            'bbox': region.bbox,
-            'centroid': region.centroid
-        }
+    final_segment_count = len(np.unique(cleaned_labels))
+    print(f"Final segment count: {final_segment_count}")
     
-    # Find adjacent regions
-    from scipy.spatial import cKDTree
-    centroids = np.array([region_stats[label]['centroid'] for label in region_stats])
-    kdtree = cKDTree(centroids)
-    
-    # For each region, find its neighbors
-    merges = []
-    for label1, stats1 in region_stats.items():
-        # Find potential neighbors (regions whose centroids are close)
-        neighbors = kdtree.query_ball_point(stats1['centroid'], r=50)
-        
-        for idx in neighbors:
-            label2 = list(region_stats.keys())[idx]
-            if label1 >= label2:
-                continue
-                
-            stats2 = region_stats[label2]
-            
-            # Compute color similarity (Euclidean distance in LAB space)
-            color_diff = np.linalg.norm(stats1['color'] - stats2['color'])
-            
-            # Compute texture similarity
-            texture_diff = np.linalg.norm(stats1['texture'] - stats2['texture'])
-            
-            # If both color and texture are similar, consider merging
-            if color_diff < 10 and texture_diff < texture_threshold:
-                # Add to merge list
-                merges.append((label1, label2))
-    
-    # Apply merges to create final segmentation
-    print(f"Planning to merge {len(merges)} region pairs...")
-    
-    final_labels = labels.copy()
-    merged = set()
-    
-    for label1, label2 in merges:
-        if label1 in merged or label2 in merged:
-            continue
-            
-        # Merge label2 into label1
-        final_labels[final_labels == label2] = label1
-        merged.add(label2)
-    
-    # Relabel to ensure sequential labels
-    final_labels = measure.label(final_labels > 0)
-    
-    # Step 6: Final cleanup - remove small regions
-    print("Step 6: Final cleanup...")
-    
-    # Remove very small regions
-    min_size = 100  # Minimum region size
-    final_labels = morphology.remove_small_objects(final_labels, min_size=min_size)
-    final_labels = measure.label(final_labels)
-    
-    return final_labels
+    return cleaned_labels
 
 
 def process_image(image_path: str, n_colors: int = 8, texture_threshold: float = 0.2) -> None:
@@ -222,7 +195,7 @@ def process_image(image_path: str, n_colors: int = 8, texture_threshold: float =
     image = io.imread(image_path)
     
     # Apply segmentation
-    print(f"Segmenting with {n_colors} colors and texture threshold {texture_threshold}...")
+    print(f"Segmenting with {n_colors} colors...")
     
     labels = texture_aware_segmentation(
         image, 
@@ -246,6 +219,10 @@ def process_image(image_path: str, n_colors: int = 8, texture_threshold: float =
         mask = labels == label
         size = np.sum(mask)
         
+        # Skip very small segments
+        if size < 50:
+            continue
+            
         # Calculate mean color
         mean_color = np.mean(image[mask], axis=0)
         # Calculate brightness for sorting

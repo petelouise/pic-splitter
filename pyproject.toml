@@ -9,6 +9,7 @@ dependencies = [
     "numpy>=2.2.4",
     "scikit-image>=0.25.2",
     "scikit-learn>=1.6.1",
+    "scipy>=1.15.2",
 ]
 
 [project.scripts]
